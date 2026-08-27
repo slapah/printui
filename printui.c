@@ -221,6 +221,86 @@ static void canon_server(wchar_t *out, size_t cap, const wchar_t *in)
     out[cap - 1] = 0;
 }
 
+
+#define PC_MODEL L"PaperCut Global PostScript - NTNS"
+
+static BOOL file_exists(const wchar_t *path)
+{
+    DWORD a = GetFileAttributesW(path);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL looks_like_papercut_inf(const wchar_t *path)
+{
+    const wchar_t *base;
+    if (!path || !path[0])
+        return TRUE;
+    base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    return _wcsicmp(base, L"PCGlobal.inf") == 0;
+}
+
+static BOOL find_papercut_inf(HWND dlg, wchar_t *out, size_t cap)
+{
+    wchar_t typed[FIELD_CAP], host[FIELD_CAP];
+    const wchar_t *s;
+    static const wchar_t *local[] = {
+        L"C:\\Program Files\\PaperCut NG\\providers\\print\\drivers\\global\\win\\PC-Global-Print-Driver\\PCGlobal.inf",
+        L"C:\\Program Files\\PaperCut MF\\providers\\print\\drivers\\global\\win\\PC-Global-Print-Driver\\PCGlobal.inf",
+        L"C:\\Program Files\\PaperCut NG\\providers\\print\\drivers\\global\\win\\PCGlobal.inf",
+        L"C:\\Program Files\\PaperCut MF\\providers\\print\\drivers\\global\\win\\PCGlobal.inf",
+        L"C:\\Program Files (x86)\\PaperCut NG\\providers\\print\\drivers\\global\\win\\PC-Global-Print-Driver\\PCGlobal.inf",
+        L"C:\\Program Files (x86)\\PaperCut MF\\providers\\print\\drivers\\global\\win\\PC-Global-Print-Driver\\PCGlobal.inf",
+        L"C:\\Program Files\\PaperCut Print Deploy Client\\PC-Global-Print-Driver\\PCGlobal.inf",
+    };
+    size_t i;
+    wchar_t cand[FIELD_CAP];
+
+    get_field(dlg, IDC_SERVER, typed, FIELD_CAP);
+    canon_server(host, FIELD_CAP, typed[0] ? typed : L"pcut1");
+    s = host;
+    while (*s == L'\\')
+        s++;
+
+    _snwprintf(cand, FIELD_CAP, L"\\\\%s\\PCClient\\win\\PC-Global-Print-Driver\\PCGlobal.inf", s);
+    cand[FIELD_CAP - 1] = 0;
+    if (file_exists(cand)) {
+        wcsncpy(out, cand, cap - 1);
+        out[cap - 1] = 0;
+        return TRUE;
+    }
+    _snwprintf(cand, FIELD_CAP, L"\\\\%s\\PCClient\\win\\PCGlobal.inf", s);
+    cand[FIELD_CAP - 1] = 0;
+    if (file_exists(cand)) {
+        wcsncpy(out, cand, cap - 1);
+        out[cap - 1] = 0;
+        return TRUE;
+    }
+    for (i = 0; i < sizeof(local) / sizeof(local[0]); i++) {
+        if (file_exists(local[i])) {
+            wcsncpy(out, local[i], cap - 1);
+            out[cap - 1] = 0;
+            return TRUE;
+        }
+    }
+    _snwprintf(out, cap, L"\\\\%s\\PCClient\\win\\PC-Global-Print-Driver\\PCGlobal.inf", s);
+    out[cap - 1] = 0;
+    return FALSE;
+}
+
+static void apply_papercut_defaults(HWND dlg, BOOL force_model, BOOL force_inf)
+{
+    wchar_t model[FIELD_CAP], inf[FIELD_CAP], found[FIELD_CAP];
+
+    get_field(dlg, IDC_MODEL, model, FIELD_CAP);
+    get_field(dlg, IDC_INF, inf, FIELD_CAP);
+    if (force_model || !model[0])
+        SetDlgItemTextW(dlg, IDC_MODEL, PC_MODEL);
+    find_papercut_inf(dlg, found, FIELD_CAP);
+    if (force_inf || !inf[0] || looks_like_papercut_inf(inf))
+        SetDlgItemTextW(dlg, IDC_INF, found);
+}
+
 static const wchar_t *printer_leaf(const wchar_t *name)
 {
     const wchar_t *slash;
@@ -349,6 +429,8 @@ static BOOL compose(HWND dlg, Op op, wchar_t *args, size_t cap, wchar_t *err, si
             goto overflow;
         if (!append_quoted_switch(args, cap, L"/m", model))
             goto overflow;
+        if (!append_quoted_switch(args, cap, L"/h", L"x64"))
+            goto overflow;
         break;
     case OP_IA:
         used_m = TRUE;
@@ -357,6 +439,10 @@ static BOOL compose(HWND dlg, Op op, wchar_t *args, size_t cap, wchar_t *err, si
         if (!append_quoted_switch(args, cap, L"/m", model))
             goto overflow;
         if (!append_quoted_switch(args, cap, L"/f", inf))
+            goto overflow;
+        if (!append_quoted_switch(args, cap, L"/h", L"x64"))
+            goto overflow;
+        if (!append_flag(args, cap, L"/u"))
             goto overflow;
         break;
     case OP_DD:
@@ -541,20 +627,18 @@ static void init_printer_list(HWND dlg)
 static void apply_list_selection(HWND dlg, int index)
 {
     HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
-    wchar_t name[FIELD_CAP], driver[FIELD_CAP], port[FIELD_CAP];
+    wchar_t name[FIELD_CAP], port[FIELD_CAP];
 
     if (index < 0)
         return;
-    name[0] = driver[0] = port[0] = 0;
+    name[0] = port[0] = 0;
     ListView_GetItemText(lv, index, 0, name, FIELD_CAP);
-    ListView_GetItemText(lv, index, 1, driver, FIELD_CAP);
     ListView_GetItemText(lv, index, 2, port, FIELD_CAP);
     g_filling_from_list = TRUE;
     SetDlgItemTextW(dlg, IDC_PRINTER, printer_leaf(name));
-    if (driver[0])
-        SetDlgItemTextW(dlg, IDC_MODEL, driver);
     if (port[0])
         SetDlgItemTextW(dlg, IDC_PORT, port);
+    apply_papercut_defaults(dlg, TRUE, TRUE);
     g_filling_from_list = FALSE;
     g_last_op = OP_ADD_NET;
     refresh(dlg);
@@ -621,6 +705,7 @@ static void refresh_printers(HWND dlg, BOOL force)
 
     wcsncpy(g_last_enum_server, server, FIELD_CAP - 1);
     g_last_enum_server[FIELD_CAP - 1] = 0;
+    apply_papercut_defaults(dlg, FALSE, FALSE);
 
     if (err) {
         wchar_t msg[400];
@@ -795,6 +880,7 @@ static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam
         SendDlgItemMessageW(dlg, IDC_DD, BCM_SETSHIELD, 0, TRUE);
         init_printer_list(dlg);
         SetDlgItemTextW(dlg, IDC_SERVER, L"\\\\pcut1");
+        apply_papercut_defaults(dlg, TRUE, TRUE);
         refresh_printers(dlg, TRUE);
         return TRUE;
 
