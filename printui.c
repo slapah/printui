@@ -2,10 +2,10 @@
  * PrintUI — Win32 GUI wrapper for rundll32 printui.dll,PrintUIEntry
  *
  * MinGW (Linux cross):
- *   x86_64-w64-mingw32-windres printui.rc -O coff -o printui.res && x86_64-w64-mingw32-gcc -O2 -s -static -static-libgcc -mwindows -municode -o PrintUI.exe printui.c printui.res -lcomctl32 -lcomdlg32 -lshell32 -luser32 -lkernel32 -lgdi32
+ *   x86_64-w64-mingw32-windres printui.rc -O coff -o printui.res && x86_64-w64-mingw32-gcc -O2 -s -static -static-libgcc -mwindows -municode -o PrintUI.exe printui.c printui.res -lcomctl32 -lcomdlg32 -lshell32 -luser32 -lkernel32 -lgdi32 -lwinspool
  *
  * MSVC:
- *   rc printui.rc && cl /nologo /O2 /MT /DUNICODE /D_UNICODE printui.c printui.res user32.lib comctl32.lib comdlg32.lib shell32.lib kernel32.lib gdi32.lib /Fe:PrintUI.exe
+ *   rc printui.rc && cl /nologo /O2 /MT /DUNICODE /D_UNICODE printui.c printui.res user32.lib comctl32.lib comdlg32.lib shell32.lib kernel32.lib gdi32.lib winspool.lib /Fe:PrintUI.exe
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -21,9 +21,11 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <winspool.h>
 #include <wchar.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "printui.h"
@@ -54,6 +56,8 @@ typedef enum {
 } Op;
 
 static Op g_last_op = OP_NONE;
+static wchar_t g_last_enum_server[FIELD_CAP];
+static BOOL g_filling_from_list = FALSE;
 
 static void trim(wchar_t *s)
 {
@@ -118,7 +122,6 @@ static void describe_char(wchar_t c, wchar_t *out, size_t cap)
     out[cap - 1] = 0;
 }
 
-/* Returns the field label if a named field contains a forbidden character. */
 static const wchar_t *invalid_named_field(HWND dlg, wchar_t *badch)
 {
     static const struct { int id; const wchar_t *name; } fields[] = {
@@ -196,6 +199,39 @@ static void make_unc(wchar_t *out, size_t cap, const wchar_t *server, const wcha
         out[cap - 1] = 0;
     }
     out[cap - 1] = 0;
+}
+
+static void canon_server(wchar_t *out, size_t cap, const wchar_t *in)
+{
+    const wchar_t *s = in ? in : L"";
+    wchar_t host[FIELD_CAP];
+    size_t n;
+
+    while (*s == L'\\')
+        s++;
+    wcsncpy(host, s, FIELD_CAP - 1);
+    host[FIELD_CAP - 1] = 0;
+    n = wcslen(host);
+    while (n && host[n - 1] == L'\\')
+        host[--n] = 0;
+    if (!n)
+        wcsncpy(out, L"\\\\pcut1", cap - 1);
+    else
+        _snwprintf(out, cap, L"\\\\%s", host);
+    out[cap - 1] = 0;
+}
+
+static const wchar_t *printer_leaf(const wchar_t *name)
+{
+    const wchar_t *slash;
+    if (!name || !name[0])
+        return L"";
+    if (name[0] == L'\\' && name[1] == L'\\') {
+        slash = wcsrchr(name, L'\\');
+        if (slash && slash[1])
+            return slash + 1;
+    }
+    return name;
 }
 
 static void set_status(HWND dlg, const wchar_t *text)
@@ -325,6 +361,7 @@ static BOOL compose(HWND dlg, Op op, wchar_t *args, size_t cap, wchar_t *err, si
         break;
     case OP_DD:
         used_m = TRUE;
+        extra_mr = FALSE;
         if (!append_flag(args, cap, L"/dd"))
             goto overflow;
         if (!append_quoted_switch(args, cap, L"/m", model))
@@ -372,33 +409,18 @@ static BOOL compose(HWND dlg, Op op, wchar_t *args, size_t cap, wchar_t *err, si
         if (!append_quoted_switch(args, cap, L"/a", settings))
             goto overflow;
         break;
-    case OP_NONE:
     default:
-        extra_mr = FALSE;
-        skip_c = TRUE;
         if (printer[0] && !append_quoted_switch(args, cap, L"/n", printer))
-            goto overflow;
-        if (server[0] && !append_quoted_switch(args, cap, L"/c", server))
-            goto overflow;
-        if (model[0] && !append_quoted_switch(args, cap, L"/m", model))
-            goto overflow;
-        if (port[0] && !append_quoted_switch(args, cap, L"/r", port))
-            goto overflow;
-        if (inf[0] && !append_quoted_switch(args, cap, L"/f", inf))
-            goto overflow;
-        if (settings[0] && !append_quoted_switch(args, cap, L"/a", settings))
             goto overflow;
         break;
     }
 
-    if (!skip_c && server[0] && !append_quoted_switch(args, cap, L"/c", server))
+    if (!skip_c && !append_quoted_switch(args, cap, L"/c", server))
         goto overflow;
-    if (extra_mr) {
-        if (!used_m && model[0] && !append_quoted_switch(args, cap, L"/m", model))
-            goto overflow;
-        if (!used_r && port[0] && !append_quoted_switch(args, cap, L"/r", port))
-            goto overflow;
-    }
+    if (extra_mr && !used_m && !append_quoted_switch(args, cap, L"/m", model))
+        goto overflow;
+    if (extra_mr && !used_r && !append_quoted_switch(args, cap, L"/r", port))
+        goto overflow;
     if (!skip_q && quiet && !append_flag(args, cap, L"/q"))
         goto overflow;
     return TRUE;
@@ -474,6 +496,152 @@ static void refresh(HWND dlg)
 {
     update_buttons(dlg);
     build_preview(dlg, g_last_op);
+}
+
+static void add_lv_col(HWND lv, int i, const wchar_t *title, int cx)
+{
+    LVCOLUMNW col;
+    memset(&col, 0, sizeof(col));
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    col.pszText = (wchar_t *)title;
+    col.cx = cx;
+    col.iSubItem = i;
+    SendMessageW(lv, LVM_INSERTCOLUMNW, (WPARAM)i, (LPARAM)&col);
+}
+
+static int lv_add_row(HWND lv, const wchar_t *name, const wchar_t *driver,
+                      const wchar_t *port, const wchar_t *comment)
+{
+    LVITEMW item;
+    int i;
+    memset(&item, 0, sizeof(item));
+    item.mask = LVIF_TEXT;
+    item.iItem = 0x7fffffff;
+    item.pszText = (wchar_t *)(name && name[0] ? name : L"");
+    i = (int)SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&item);
+    if (i < 0)
+        return -1;
+    ListView_SetItemText(lv, i, 1, (wchar_t *)(driver && driver[0] ? driver : L""));
+    ListView_SetItemText(lv, i, 2, (wchar_t *)(port && port[0] ? port : L""));
+    ListView_SetItemText(lv, i, 3, (wchar_t *)(comment && comment[0] ? comment : L""));
+    return i;
+}
+
+static void init_printer_list(HWND dlg)
+{
+    HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
+    ListView_SetExtendedListViewStyle(lv,
+        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_GRIDLINES);
+    add_lv_col(lv, 0, L"Printer", 160);
+    add_lv_col(lv, 1, L"Driver", 140);
+    add_lv_col(lv, 2, L"Port", 80);
+    add_lv_col(lv, 3, L"Comment", 140);
+}
+
+static void apply_list_selection(HWND dlg, int index)
+{
+    HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
+    wchar_t name[FIELD_CAP], driver[FIELD_CAP], port[FIELD_CAP];
+
+    if (index < 0)
+        return;
+    name[0] = driver[0] = port[0] = 0;
+    ListView_GetItemText(lv, index, 0, name, FIELD_CAP);
+    ListView_GetItemText(lv, index, 1, driver, FIELD_CAP);
+    ListView_GetItemText(lv, index, 2, port, FIELD_CAP);
+    g_filling_from_list = TRUE;
+    SetDlgItemTextW(dlg, IDC_PRINTER, printer_leaf(name));
+    if (driver[0])
+        SetDlgItemTextW(dlg, IDC_MODEL, driver);
+    if (port[0])
+        SetDlgItemTextW(dlg, IDC_PORT, port);
+    g_filling_from_list = FALSE;
+    g_last_op = OP_ADD_NET;
+    refresh(dlg);
+}
+
+static DWORD enum_level(HWND lv, const wchar_t *server, DWORD level)
+{
+    DWORD needed = 0, returned = 0, i;
+    BYTE *buf;
+    DWORD err;
+
+    EnumPrintersW(PRINTER_ENUM_NAME, (LPWSTR)server, level, NULL, 0, &needed, &returned);
+    err = GetLastError();
+    if (!needed)
+        return err ? err : ERROR_INVALID_PARAMETER;
+    buf = (BYTE *)malloc(needed);
+    if (!buf)
+        return ERROR_OUTOFMEMORY;
+    if (!EnumPrintersW(PRINTER_ENUM_NAME, (LPWSTR)server, level, buf, needed, &needed, &returned)) {
+        err = GetLastError();
+        free(buf);
+        return err;
+    }
+    if (level == 2) {
+        PRINTER_INFO_2W *p = (PRINTER_INFO_2W *)buf;
+        for (i = 0; i < returned; i++) {
+            const wchar_t *nm = p[i].pShareName && p[i].pShareName[0]
+                ? p[i].pShareName : printer_leaf(p[i].pPrinterName);
+            lv_add_row(lv, nm, p[i].pDriverName, p[i].pPortName, p[i].pComment);
+        }
+    } else {
+        PRINTER_INFO_1W *p = (PRINTER_INFO_1W *)buf;
+        for (i = 0; i < returned; i++)
+            lv_add_row(lv, printer_leaf(p[i].pName), L"", L"", p[i].pComment);
+    }
+    free(buf);
+    return 0;
+}
+
+static void refresh_printers(HWND dlg, BOOL force)
+{
+    wchar_t typed[FIELD_CAP], server[FIELD_CAP], line[STATUS_CAP];
+    HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
+    DWORD err;
+
+    get_field(dlg, IDC_SERVER, typed, FIELD_CAP);
+    if (!typed[0])
+        wcscpy(typed, L"pcut1");
+    canon_server(server, FIELD_CAP, typed);
+
+    if (!force && g_last_enum_server[0] && _wcsicmp(server, g_last_enum_server) == 0)
+        return;
+
+    SetDlgItemTextW(dlg, IDC_SERVER, server);
+    ListView_DeleteAllItems(lv);
+    _snwprintf(line, STATUS_CAP, L"Querying %s ...", server);
+    line[STATUS_CAP - 1] = 0;
+    set_status(dlg, line);
+    UpdateWindow(GetDlgItem(dlg, IDC_STATUS));
+
+    err = enum_level(lv, server, 2);
+    if (err)
+        err = enum_level(lv, server, 1);
+
+    wcsncpy(g_last_enum_server, server, FIELD_CAP - 1);
+    g_last_enum_server[FIELD_CAP - 1] = 0;
+
+    if (err) {
+        wchar_t msg[400];
+        DWORD n = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                 NULL, err, 0, msg, 400, NULL);
+        if (n) {
+            trim(msg);
+            _snwprintf(line, STATUS_CAP, L"%s: %s", server, msg);
+        } else {
+            _snwprintf(line, STATUS_CAP, L"%s: error %lu (list fills on Windows against that server)",
+                       server, (unsigned long)err);
+        }
+        line[STATUS_CAP - 1] = 0;
+        set_status(dlg, line);
+    } else {
+        int count = ListView_GetItemCount(lv);
+        _snwprintf(line, STATUS_CAP, L"%s — %d printer%s", server, count, count == 1 ? L"" : L"s");
+        line[STATUS_CAP - 1] = 0;
+        set_status(dlg, line);
+    }
+    refresh(dlg);
 }
 
 static BOOL browse_file(HWND dlg, int dest_id, BOOL inf, BOOL save)
@@ -612,7 +780,6 @@ static void launch(HWND dlg, Op op, BOOL elevate)
 
 static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    (void)lParam;
     switch (msg) {
     case WM_INITDIALOG:
         SendDlgItemMessageW(dlg, IDC_PRINTER, EM_SETLIMITTEXT, FIELD_CAP - 1, 0);
@@ -626,21 +793,42 @@ static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam
         SendDlgItemMessageW(dlg, IDC_IF, BCM_SETSHIELD, 0, TRUE);
         SendDlgItemMessageW(dlg, IDC_IA, BCM_SETSHIELD, 0, TRUE);
         SendDlgItemMessageW(dlg, IDC_DD, BCM_SETSHIELD, 0, TRUE);
-        refresh(dlg);
-        set_status(dlg, L"Ready");
+        init_printer_list(dlg);
+        SetDlgItemTextW(dlg, IDC_SERVER, L"\\\\pcut1");
+        refresh_printers(dlg, TRUE);
         return TRUE;
+
+    case WM_NOTIFY:
+        if (((NMHDR *)lParam)->idFrom == IDC_PRINTER_LIST) {
+            NMITEMACTIVATE *nm = (NMITEMACTIVATE *)lParam;
+            if (nm->hdr.code == NM_CLICK || nm->hdr.code == NM_DBLCLK ||
+                nm->hdr.code == LVN_ITEMACTIVATE) {
+                if (nm->iItem >= 0)
+                    apply_list_selection(dlg, nm->iItem);
+                return TRUE;
+            }
+        }
+        break;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDC_PRINTER:
-        case IDC_SERVER:
         case IDC_MODEL:
         case IDC_PORT:
         case IDC_INF:
         case IDC_SETTINGS:
         case IDC_RAW:
-            if (HIWORD(wParam) == EN_CHANGE)
+            if (HIWORD(wParam) == EN_CHANGE && !g_filling_from_list)
                 refresh(dlg);
+            return TRUE;
+        case IDC_SERVER:
+            if (HIWORD(wParam) == EN_CHANGE && !g_filling_from_list)
+                refresh(dlg);
+            if (HIWORD(wParam) == EN_KILLFOCUS)
+                refresh_printers(dlg, FALSE);
+            return TRUE;
+        case IDC_REFRESH:
+            refresh_printers(dlg, TRUE);
             return TRUE;
         case IDC_QUIET:
             if (HIWORD(wParam) == BN_CLICKED)
@@ -651,7 +839,6 @@ static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam
                 refresh(dlg);
             return TRUE;
         case IDC_SETTINGS_BROWSE:
-            /* GetOpenFileNameW without FILEMUSTEXIST so a new .dat can be typed. */
             {
                 wchar_t file[FIELD_CAP];
                 OPENFILENAMEW ofn;
@@ -709,7 +896,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     (void)cmd;
     (void)show;
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES;
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
     DialogBoxW(inst, MAKEINTRESOURCEW(IDD_MAIN), NULL, DlgProc);
     return 0;

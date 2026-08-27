@@ -2,8 +2,11 @@
 
 #define IDD_MAIN                 100
 
-#define IDC_PRINTER              101
 #define IDC_SERVER               102
+#define IDC_REFRESH              114
+#define IDC_PRINTER_LIST         115
+
+#define IDC_PRINTER              101
 #define IDC_MODEL                103
 #define IDC_PORT                 104
 #define IDC_QUIET                105
