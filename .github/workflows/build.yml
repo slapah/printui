@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Build PrintUI.exe
+        run: |
+          x86_64-w64-mingw32-windres printui.rc -O coff -o printui.res
+          x86_64-w64-mingw32-gcc -O2 -s -static -static-libgcc -mwindows -municode \
+            -o PrintUI.exe printui.c printui.res \
+            -lcomctl32 -lcomdlg32 -lshell32 -luser32 -lkernel32 -lgdi32 -lwinspool
+          ls -l PrintUI.exe
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrintUI
+          path: PrintUI.exe
+
+      - name: Publish latest release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          files: PrintUI.exe

@@ -16,6 +16,12 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#ifndef _WIN32_IE
+#define _WIN32_IE 0x0600
+#endif
 
 #include <windows.h>
 #include <commctrl.h>
@@ -58,6 +64,20 @@ typedef enum {
 static Op g_last_op = OP_NONE;
 static wchar_t g_last_enum_server[FIELD_CAP];
 static BOOL g_filling_from_list = FALSE;
+
+/* Campus buckets — a printer is placed by the prefix of its (share) name.
+ *   UN..    -> Union
+ *   MSMS..  -> Maxine Smith
+ *   WH..    -> Whitehaven
+ *   MA..    -> Macon   (MAAB, MAAC, MAAA, MAFR, MATH, ...)
+ * Anything else falls into Other. */
+#define GRP_UNION       1
+#define GRP_MAXINE      2
+#define GRP_WHITEHAVEN  3
+#define GRP_MACON       4
+#define GRP_OTHER       5
+#define GRP_COUNT       5
+static int g_group_counts[GRP_COUNT + 1];
 
 static void trim(wchar_t *s)
 {
@@ -584,6 +604,62 @@ static void refresh(HWND dlg)
     build_preview(dlg, g_last_op);
 }
 
+static int campus_of(const wchar_t *name)
+{
+    if (!name)
+        return GRP_OTHER;
+    while (*name == L' ' || *name == L'\t')
+        name++;
+    if (_wcsnicmp(name, L"MSMS", 4) == 0)
+        return GRP_MAXINE;
+    if (_wcsnicmp(name, L"UN", 2) == 0)
+        return GRP_UNION;
+    if (_wcsnicmp(name, L"WH", 2) == 0)
+        return GRP_WHITEHAVEN;
+    if (_wcsnicmp(name, L"MA", 2) == 0)
+        return GRP_MACON;
+    return GRP_OTHER;
+}
+
+static const wchar_t *group_name(int id)
+{
+    switch (id) {
+    case GRP_UNION:      return L"Union";
+    case GRP_MAXINE:     return L"Maxine Smith";
+    case GRP_WHITEHAVEN: return L"Whitehaven";
+    case GRP_MACON:      return L"Macon";
+    default:             return L"Other";
+    }
+}
+
+static void lv_add_group(HWND lv, int id)
+{
+    LVGROUP g;
+    memset(&g, 0, sizeof(g));
+    g.cbSize = sizeof(g);
+    g.mask = LVGF_HEADER | LVGF_GROUPID;
+    g.pszHeader = (LPWSTR)group_name(id);
+    g.iGroupId = id;
+    SendMessageW(lv, LVM_INSERTGROUP, (WPARAM)-1, (LPARAM)&g);
+}
+
+static void reset_groups(HWND lv)
+{
+    int id;
+    SendMessageW(lv, LVM_REMOVEALLGROUPS, 0, 0);
+    memset(g_group_counts, 0, sizeof(g_group_counts));
+    for (id = 1; id <= GRP_COUNT; id++)
+        lv_add_group(lv, id);
+}
+
+static void prune_empty_groups(HWND lv)
+{
+    int id;
+    for (id = 1; id <= GRP_COUNT; id++)
+        if (g_group_counts[id] == 0)
+            SendMessageW(lv, LVM_REMOVEGROUP, (WPARAM)id, 0);
+}
+
 static void add_lv_col(HWND lv, int i, const wchar_t *title, int cx)
 {
     LVCOLUMNW col;
@@ -599,10 +675,12 @@ static int lv_add_row(HWND lv, const wchar_t *name, const wchar_t *driver,
                       const wchar_t *port, const wchar_t *comment)
 {
     LVITEMW item;
-    int i;
+    int i, group;
+    group = campus_of(name);
     memset(&item, 0, sizeof(item));
-    item.mask = LVIF_TEXT;
+    item.mask = LVIF_TEXT | LVIF_GROUPID;
     item.iItem = 0x7fffffff;
+    item.iGroupId = group;
     item.pszText = (wchar_t *)(name && name[0] ? name : L"");
     i = (int)SendMessageW(lv, LVM_INSERTITEMW, 0, (LPARAM)&item);
     if (i < 0)
@@ -610,6 +688,7 @@ static int lv_add_row(HWND lv, const wchar_t *name, const wchar_t *driver,
     ListView_SetItemText(lv, i, 1, (wchar_t *)(driver && driver[0] ? driver : L""));
     ListView_SetItemText(lv, i, 2, (wchar_t *)(port && port[0] ? port : L""));
     ListView_SetItemText(lv, i, 3, (wchar_t *)(comment && comment[0] ? comment : L""));
+    g_group_counts[group]++;
     return i;
 }
 
@@ -618,13 +697,16 @@ static void init_printer_list(HWND dlg)
     HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
     ListView_SetExtendedListViewStyle(lv,
         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_GRIDLINES);
+    SendMessageW(lv, LVM_ENABLEGROUPVIEW, TRUE, 0);
     add_lv_col(lv, 0, L"Printer", 160);
     add_lv_col(lv, 1, L"Driver", 140);
     add_lv_col(lv, 2, L"Port", 80);
     add_lv_col(lv, 3, L"Comment", 140);
 }
 
-static void apply_list_selection(HWND dlg, int index)
+/* Copy one list row into the Selected-printer fields (name + port) and refresh
+ * the PaperCut model/INF defaults. Guarded so the EN_CHANGE handlers stay quiet. */
+static void fill_fields_from_row(HWND dlg, int index)
 {
     HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
     wchar_t name[FIELD_CAP], port[FIELD_CAP];
@@ -640,6 +722,13 @@ static void apply_list_selection(HWND dlg, int index)
         SetDlgItemTextW(dlg, IDC_PORT, port);
     apply_papercut_defaults(dlg, TRUE, TRUE);
     g_filling_from_list = FALSE;
+}
+
+static void apply_list_selection(HWND dlg, int index)
+{
+    if (index < 0)
+        return;
+    fill_fields_from_row(dlg, index);
     g_last_op = OP_ADD_NET;
     refresh(dlg);
 }
@@ -694,6 +783,7 @@ static void refresh_printers(HWND dlg, BOOL force)
 
     SetDlgItemTextW(dlg, IDC_SERVER, server);
     ListView_DeleteAllItems(lv);
+    reset_groups(lv);
     _snwprintf(line, STATUS_CAP, L"Querying %s ...", server);
     line[STATUS_CAP - 1] = 0;
     set_status(dlg, line);
@@ -703,6 +793,7 @@ static void refresh_printers(HWND dlg, BOOL force)
     if (err)
         err = enum_level(lv, server, 1);
 
+    prune_empty_groups(lv);
     wcsncpy(g_last_enum_server, server, FIELD_CAP - 1);
     g_last_enum_server[FIELD_CAP - 1] = 0;
     apply_papercut_defaults(dlg, FALSE, FALSE);
@@ -764,13 +855,155 @@ static BOOL browse_file(HWND dlg, int dest_id, BOOL inf, BOOL save)
     return TRUE;
 }
 
+/* Operations that act on a printer queue and so can be applied to a whole
+ * multi-selection, one rundll32 invocation per selected row. Driver-level and
+ * file-based ops (IF/IA/DD/SS/SR) and RAW stay single-shot. */
+static BOOL op_is_batchable(Op op)
+{
+    switch (op) {
+    case OP_ADD_NET:
+    case OP_DEL_NET:
+    case OP_DEL_LOCAL:
+    case OP_Y:
+    case OP_K:
+    case OP_P:
+    case OP_O:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* Compose from the current fields and run one rundll32 invocation.
+ * Returns TRUE if the process launched (its exit code is stored in *code).
+ * On failure returns FALSE: *launch_err holds the Win32 error for a launch
+ * failure (0 if the failure was compose-time), and err[] holds the message. */
+static BOOL run_current(HWND dlg, Op op, BOOL elevate, DWORD *code,
+                        DWORD *launch_err, wchar_t *err, size_t ecap)
+{
+    wchar_t rundll[MAX_PATH], args[CMD_CAP];
+    wchar_t cmdline[CMD_CAP], params[CMD_CAP];
+
+    *code = 0;
+    *launch_err = 0;
+
+    if (!compose(dlg, op, args, CMD_CAP, err, ecap))
+        return FALSE;
+
+    get_rundll32(rundll, MAX_PATH);
+    if (args[0])
+        _snwprintf(cmdline, CMD_CAP, L"\"%s\" printui.dll,PrintUIEntry %s", rundll, args);
+    else
+        _snwprintf(cmdline, CMD_CAP, L"\"%s\" printui.dll,PrintUIEntry", rundll);
+    cmdline[CMD_CAP - 1] = 0;
+    SetDlgItemTextW(dlg, IDC_PREVIEW, cmdline);
+
+    if (!elevate) {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        memset(&pi, 0, sizeof(pi));
+        if (!CreateProcessW(rundll, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            *launch_err = GetLastError();
+            return FALSE;
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        GetExitCodeProcess(pi.hProcess, code);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return TRUE;
+    }
+
+    {
+        SHELLEXECUTEINFOW sei;
+        memset(&sei, 0, sizeof(sei));
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.hwnd = dlg;
+        sei.lpVerb = L"runas";
+        sei.lpFile = rundll;
+        _snwprintf(params, CMD_CAP, L"printui.dll,PrintUIEntry %s", args);
+        params[CMD_CAP - 1] = 0;
+        sei.lpParameters = params;
+        sei.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&sei)) {
+            *launch_err = GetLastError();
+            return FALSE;
+        }
+        if (!sei.hProcess) {
+            *launch_err = ERROR_INVALID_HANDLE;
+            return FALSE;
+        }
+        WaitForSingleObject(sei.hProcess, INFINITE);
+        GetExitCodeProcess(sei.hProcess, code);
+        CloseHandle(sei.hProcess);
+        return TRUE;
+    }
+}
+
+/* Apply op to every selected row in turn, filling the Selected-printer fields
+ * from each row before composing. Stops early if the user cancels a UAC prompt. */
+static void launch_selected(HWND dlg, Op op, BOOL elevate, HWND lv, int sel)
+{
+    wchar_t save_printer[FIELD_CAP], save_port[FIELD_CAP], line[STATUS_CAP];
+    int ok = 0, fail = 0, done = 0, i = -1;
+    BOOL cancelled = FALSE;
+
+    get_field(dlg, IDC_PRINTER, save_printer, FIELD_CAP);
+    get_field(dlg, IDC_PORT, save_port, FIELD_CAP);
+
+    for (;;) {
+        DWORD code = 0, lerr = 0;
+        wchar_t err[STATUS_CAP];
+
+        i = (int)SendMessageW(lv, LVM_GETNEXTITEM, (WPARAM)i, LVNI_SELECTED);
+        if (i < 0)
+            break;
+
+        fill_fields_from_row(dlg, i);
+        done++;
+        _snwprintf(line, STATUS_CAP, L"Working %d of %d ...", done, sel);
+        line[STATUS_CAP - 1] = 0;
+        set_status(dlg, line);
+        UpdateWindow(GetDlgItem(dlg, IDC_STATUS));
+
+        if (!run_current(dlg, op, elevate, &code, &lerr, err, STATUS_CAP)) {
+            fail++;
+            if (lerr == ERROR_CANCELLED) {
+                cancelled = TRUE;
+                break;
+            }
+        } else if (code == 0) {
+            ok++;
+        } else {
+            fail++;
+        }
+    }
+
+    g_filling_from_list = TRUE;
+    SetDlgItemTextW(dlg, IDC_PRINTER, save_printer);
+    SetDlgItemTextW(dlg, IDC_PORT, save_port);
+    g_filling_from_list = FALSE;
+
+    if (cancelled)
+        _snwprintf(line, STATUS_CAP, L"Cancelled at UAC — %d ok, %d failed of %d selected",
+                   ok, fail, sel);
+    else
+        _snwprintf(line, STATUS_CAP, L"%d printers: %d ok, %d failed", sel, ok, fail);
+    line[STATUS_CAP - 1] = 0;
+    set_status(dlg, line);
+    refresh(dlg);
+}
+
 static void launch(HWND dlg, Op op, BOOL elevate)
 {
-    wchar_t rundll[MAX_PATH], args[CMD_CAP], err[STATUS_CAP];
-    wchar_t cmdline[CMD_CAP], params[CMD_CAP];
+    wchar_t err[STATUS_CAP];
     wchar_t msg[512], chdesc[64], badch = 0;
     const wchar_t *badfield;
-    DWORD code;
+    HWND lv = GetDlgItem(dlg, IDC_PRINTER_LIST);
+    DWORD code = 0, lerr = 0;
+    int sel;
 
     g_last_op = op;
     build_preview(dlg, op);
@@ -798,69 +1031,23 @@ static void launch(HWND dlg, Op op, BOOL elevate)
         }
     }
 
-    if (!compose(dlg, op, args, CMD_CAP, err, STATUS_CAP)) {
-        MessageBoxW(dlg, err[0] ? err : L"Failed to compose arguments.",
-                    L"PrintUI", MB_OK | MB_ICONWARNING);
+    sel = (int)SendMessageW(lv, LVM_GETSELECTEDCOUNT, 0, 0);
+    if (op_is_batchable(op) && sel > 1) {
+        launch_selected(dlg, op, elevate, lv, sel);
         return;
     }
 
-    get_rundll32(rundll, MAX_PATH);
-    if (args[0])
-        _snwprintf(cmdline, CMD_CAP, L"\"%s\" printui.dll,PrintUIEntry %s", rundll, args);
-    else
-        _snwprintf(cmdline, CMD_CAP, L"\"%s\" printui.dll,PrintUIEntry", rundll);
-    cmdline[CMD_CAP - 1] = 0;
-    SetDlgItemTextW(dlg, IDC_PREVIEW, cmdline);
-
-    if (!elevate) {
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        memset(&si, 0, sizeof(si));
-        si.cb = sizeof(si);
-        memset(&pi, 0, sizeof(pi));
-        if (!CreateProcessW(rundll, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-            report_fail(dlg, GetLastError());
-            return;
-        }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        _snwprintf(err, STATUS_CAP, L"exit code %lu", (unsigned long)code);
-        err[STATUS_CAP - 1] = 0;
-        set_status(dlg, err);
+    if (!run_current(dlg, op, elevate, &code, &lerr, err, STATUS_CAP)) {
+        if (lerr)
+            report_fail(dlg, lerr);
+        else
+            MessageBoxW(dlg, err[0] ? err : L"Failed to compose arguments.",
+                        L"PrintUI", MB_OK | MB_ICONWARNING);
         return;
     }
-
-    {
-        SHELLEXECUTEINFOW sei;
-        memset(&sei, 0, sizeof(sei));
-        sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.hwnd = dlg;
-        sei.lpVerb = L"runas";
-        sei.lpFile = rundll;
-        _snwprintf(params, CMD_CAP, L"printui.dll,PrintUIEntry %s", args);
-        params[CMD_CAP - 1] = 0;
-        sei.lpParameters = params;
-        sei.nShow = SW_SHOWNORMAL;
-        if (!ShellExecuteExW(&sei)) {
-            report_fail(dlg, GetLastError());
-            return;
-        }
-        if (!sei.hProcess) {
-            set_status(dlg, L"elevated launch returned no process handle");
-            return;
-        }
-        WaitForSingleObject(sei.hProcess, INFINITE);
-        code = 0;
-        GetExitCodeProcess(sei.hProcess, &code);
-        CloseHandle(sei.hProcess);
-        _snwprintf(err, STATUS_CAP, L"exit code %lu", (unsigned long)code);
-        err[STATUS_CAP - 1] = 0;
-        set_status(dlg, err);
-    }
+    _snwprintf(err, STATUS_CAP, L"exit code %lu", (unsigned long)code);
+    err[STATUS_CAP - 1] = 0;
+    set_status(dlg, err);
 }
 
 static INT_PTR CALLBACK DlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
